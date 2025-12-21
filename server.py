@@ -275,7 +275,15 @@ def login():
     u = users_collection.find_one({"username": d['username']})
     if not u or not check_password_hash(u['password'], d['password']): return jsonify({'error': 'Invalid'}), 401
     token = jwt.encode({'id': u['id'], 'exp': datetime.utcnow()+timedelta(days=7)}, SECRET_KEY, algorithm="HS256")
-    return jsonify({'token': token, 'role': u['role'], 'coins': u['coins'], 'id': u['id'], 'subscription': u.get('subscription', 'free')})
+    return jsonify({
+        'token': token, 
+        'id': u['id'],
+        'username': u['username'],
+        'role': u['role'], 
+        'coins': u['coins'], 
+        'subscription': u.get('subscription', 'free'),
+        'affiliate_balance': u.get('affiliate_balance', 0.0)
+    })
 
 @app.route('/api/signup', methods=['POST'])
 def signup():
@@ -284,14 +292,31 @@ def signup():
     uid = str(uuid.uuid4())
     users_collection.insert_one({
         "id": uid, "username": d['username'], "password": generate_password_hash(d['password']),
-        "coins": 1.0, "subscription": "free", "role": "user"
+        "coins": 1.0, "subscription": "free", "role": "user",
+        "referred_by": d.get('referral_code'),
+        "affiliate_balance": 0.0
     })
     token = jwt.encode({'id': uid, 'exp': datetime.utcnow()+timedelta(days=7)}, SECRET_KEY, algorithm="HS256")
-    return jsonify({'token': token, 'id': uid, 'coins': 1.0, 'subscription': 'free', 'role': 'user'})
+    return jsonify({
+        'token': token, 
+        'id': uid, 
+        'username': d['username'],
+        'coins': 1.0, 
+        'subscription': 'free', 
+        'role': 'user',
+        'affiliate_balance': 0.0
+    })
 
 @app.route('/api/me', methods=['GET'])
 @token_required
-def me(u): return jsonify({"id": u["id"], "username": u["username"], "coins": u["coins"], "subscription": u.get("subscription", "free")})
+def me(u): return jsonify({
+    "id": u["id"], 
+    "username": u["username"], 
+    "coins": u["coins"], 
+    "subscription": u.get("subscription", "free"),
+    "affiliate_balance": u.get("affiliate_balance", 0.0),
+    "role": u.get("role", "user")
+})
 
 # --- SESSION ROUTES ---
 @app.route('/api/sessions', methods=['GET', 'POST', 'DELETE'])
@@ -313,6 +338,7 @@ def sessions(u):
     if request.method == 'POST':
         d = request.json
         # Upsert
+        if '_id' in d: del d['_id'] # FIX: Remove Immutable Field
         sessions_collection.update_one({"id": d['id']}, {"$set": d}, upsert=True)
         return jsonify({'status': 'ok'})
 
@@ -320,6 +346,56 @@ def sessions(u):
         sid = request.args.get('id')
         sessions_collection.data = [x for x in sessions_collection.data if x['id'] != sid] if isinstance(sessions_collection, MockCollection) else sessions_collection.delete_one({"id": sid})
         return jsonify({'status': 'deleted'})
+
+
+# --- SUBSCRIPTION ROUTES ---
+@app.route('/api/subscribe', methods=['POST'])
+@token_required
+def subscribe(u):
+    d = request.json
+    plan = d.get('plan') # 'infantry' or 'commander'
+    
+    if plan not in ['infantry', 'commander']:
+        return jsonify({'error': 'Invalid Plan'}), 400
+
+    # Logic: Credit Coins + Set Tier
+    coins_to_add = 0
+    price = 0.0
+    if plan == 'infantry': 
+        coins_to_add = 1000
+        price = 4.99
+    if plan == 'commander': 
+        coins_to_add = 10000
+        price = 9.99
+    
+    # Update User
+    users_collection.update_one(
+        {"id": u['id']}, 
+        {
+            "$set": {"subscription": plan},
+            "$inc": {"coins": coins_to_add}
+        }
+    )
+
+    # Referral Commission (10%)
+    referrer_code = u.get('referred_by')
+    if referrer_code and referrer_code != 'null':
+        commission = price * 0.10
+        # Referrer Code IS the Username as per signup logic
+        users_collection.update_one(
+            {"username": referrer_code},
+            {"$inc": {"affiliate_balance": commission}}
+        )
+    
+    # Return new/predicted state for immediate UI update
+    new_total_coins = u.get('coins', 0) + coins_to_add
+    
+    return jsonify({
+        'status': 'ok', 
+        'coins_added': coins_to_add, 
+        'new_total_coins': new_total_coins,
+        'new_tier': plan
+    })
 
 # --- ADMIN ROUTES ---
 @app.route('/api/admin/stats', methods=['GET'])
@@ -354,20 +430,68 @@ def admin_stats(u):
         subs['infantry'] = users_collection.count_documents({"subscription": "infantry"})
         subs['commander'] = users_collection.count_documents({"subscription": "commander"})
 
+    # Referral Stats
+    referred_users = 0
+    if isinstance(users_collection, MockCollection):
+         referred_users = 0
+    else:
+        # Count users where referred_by exists and is not null
+        referred_users = users_collection.count_documents({"referred_by": {"$nin": [None, "", "null"]}})
+
+    independent_users = total_users - referred_users
+
     return jsonify({
         "total_users": total_users,
         "total_coins": total_coins,
-        "subs": subs
+        "subs": subs,
+        "referral_stats": {
+            "referred": referred_users,
+            "independent": independent_users
+        }
     })
+
+
+
+# --- DELETE USER ENDPOINT ---
+@app.route('/api/admin/users/<uid>', methods=['DELETE'])
+@token_required
+def delete_user(u, uid):
+    if u['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
+    
+    # Cascade Delete: User + Their Sessions
+    users_collection.delete_one({"id": uid})
+    sessions_collection.delete_many({"userId": uid})
+    
+    return jsonify({'status': 'deleted'})
 
 @app.route('/api/admin/users', methods=['GET'])
 @token_required
-def admin_users(u):
+def admin_users_list(u):
     if u['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
-    users = users_collection.find({})
+    users_list = list(users_collection.find({}))
+    
+    # Calculate Referral Counts (Inefficient but fine for small scale)
+    # In production, use aggregation or counters.
+    counts = {}
+    paid_counts = {}
+    
+    # Pass 1: Count referrals per user
+    for x in users_list:
+        referrer = x.get('referred_by')
+        if referrer and referrer != 'null': # Check distinct
+             # Referrer is a CODE, usually 'dictator_ref' stored.
+             # Need to find User ID by Referral Code?
+             # Wait, in signup: referred_by = d.get('referral_code').
+             # Referral Code IS User ID (usually).
+             counts[referrer] = counts.get(referrer, 0) + 1
+             if x.get('subscription', 'free') != 'free':
+                 paid_counts[referrer] = paid_counts.get(referrer, 0) + 1
+
     res = []
-    for x in users:
+    for x in users_list:
         x['_id'] = str(x.get('_id', ''))
+        x['referrals_count'] = counts.get(x['username'], 0)
+        x['paid_referrals_count'] = paid_counts.get(x['username'], 0)
         res.append(x)
     return jsonify(res)
 

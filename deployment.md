@@ -22,6 +22,7 @@ Add these in the Render Dashboard:
 | `SECRET_KEY` | [Generate a random strong string] |
 | `MONGO_URI` | [Your MongoDB Connection String] |
 
-## 3. Serving Frontend?
-*   **If Independent**: Ignore this.
-*   **If Monolithic**: Check that `dist` folder exists inside `middleware` and contains the React build files.
+## 3. Important Note
+*   This Middleware is now an **API Only** server.
+*   It does **NOT** serve the Frontend files.
+*   You do **NOT** need a `dist` folder here.
