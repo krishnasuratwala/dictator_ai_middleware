@@ -12,6 +12,8 @@ import time
 import queue
 import threading
 import json
+import itertools
+unique_counter = itertools.count()
 
 app = Flask(__name__, static_folder='dist', static_url_path='')
 CORS(app)
@@ -24,10 +26,10 @@ GPU_NODE_URL = os.getenv("GPU_NODE_URL", "http://127.0.0.1:6000").rstrip('/') + 
 SECRET_KEY = os.getenv("SECRET_KEY", "dictator_ai_top_secret_key_v1")
 
 # --- CONCURRENCY CONTROL (SCALABLE QUEUE) ---
-# We limit concurrent requests to GPU Node to avoid overloading Python/Vast
-MAX_WORKERS = 4 
+# MAX_WORKERS = 20  <-- CHANGE THIS TO 20 (Matches your optimized GPU Node)
+MAX_WORKERS = 20 
 request_queue = queue.PriorityQueue()
-worker_sem = threading.Semaphore(MAX_WORKERS)
+active_requests_sem = threading.Semaphore(MAX_WORKERS)
 
 # --- DB SETUP (Simulated for brevity, full code assumed same as before) ---
 class MockCollection:
@@ -64,9 +66,7 @@ try:
     sessions_collection = db["sessions"]
     print(f"✅ DB Connected")
 except:
-    print(f"⚠️ Using Mock DB with Dummy Data")
-    users_collection = MockCollection("users")
-    sessions_collection = MockCollection("sessions")
+    print("❌ DB Connection Failed , Please refresh the page")
 
 # --- AUTH DECORATOR ---
 def token_required(f):
@@ -84,33 +84,7 @@ def token_required(f):
         return f(user, *args, **kwargs)
     return decorated
 
-# --- STREAMING PROXY LOGIC ---
-def stream_proxy(payload):
-    """
-    Generator that forwards data from Backend.
-    """
-    try:
-        # Connect to Backend
-        # We assume the connection is the point of failure. 
-        # If this raises, we catch it in 'chat' endpoint for reimbursement?
-        # NO, 'chat' endpoint wraps this in Response. 
-        # So we must handle "yield" here.
-        # BUT, if we yield anything, the response started (200 OK). 
-        # So client sees 200 OK then error chunk. 
-        # Better: Do a "Health Check" or short timeout connect before yielding?
-        # Or, just accept that mid-stream failure requires complex client handling.
-        # User wants "manual testing... coins not spent".
-        # If I change 'chat' to connect FIRST, then return Response, I can catch failure and reimburse.
-        pass # Logic handled in 'chat' function below
-    except Exception as e:
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
-    
-    yield "data: [DONE]\n\n"
-
-# Helper for connection
-def connect_to_gpu(payload):
-    return requests.post(GPU_NODE_URL, json=payload, stream=True, timeout=120)
-
+# --- REPLACED CHAT ROUTE ---
 @app.route('/chat', methods=['POST'])
 @token_required
 def chat(current_user):
@@ -119,148 +93,143 @@ def chat(current_user):
     style = data.get('style', 'The Berghof')
     tier = current_user.get('subscription', 'free')
 
-    # 1. Billing
-    if current_user.get('coins', 0) < 0.20:
+    # 1. Billing Check
+    cost = 0.20
+    if current_user.get('coins', 0) < cost:
         return jsonify({"error": "MUNITIONS_DEPLETED"}), 402
     
-    users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": -0.20}})
+    # Deduct immediately (Refund if failure)
+    users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": -cost}})
 
-    # 2. Priority
+    # 2. Assign Priority (Lower Number = Higher Priority)
+    # Commander (1) > Infantry (2) > Conscript (3)
     priority = 3
     if tier == 'infantry': priority = 2
     if tier == 'commander': priority = 1
 
-    payload = {
-        "messages": messages,
-        "style": style,
-        "tier": tier
-    }
+    sessionId = data.get('sessionId')
 
-    # 3. Queue Logic (Wait for Slot)
-    # Since we are inside a Request Handler, we can't easily "put in queue and return later" 
-    # without WebSockets. We MUST blocking-wait for a slot to stream the response.
-    # To respect Priority, we acquire from the Semaphore via a Priority Queue mechanism?
-    # Actually, Semaphore doesn't respect priority.
-    # Implementation: Put (Priority, Event) in Queue. Worker Thread releases Events based on Priority.
-    
-    # Simple Scalable Approach:
-    # We use a helper function to acquire a "Worker Token"
-    
-    slot_available = worker_sem.acquire(timeout=10) # Wait up to 10s for a slot
-    if not slot_available:
-        # Reimburse
-        users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": 0.20}})
-        return jsonify({"error": "SERVER_BUSY"}), 503
+    # --- HISTORY INJECTION & PROMPT CONSTRUCTION ---
+    # 1. Start with System Prompt (From frontend's first message)
+    sys_prompt = messages[0]['content'] if messages and messages[0]['role'] == 'system' else ""
+    user_input = messages[-1]['content'] if messages and messages[-1]['role'] == 'user' else ""
+    # Note: Frontend now sends [System, User] or just [User].
+    # If [System, User], then messages[1] is user.
+    if len(messages) > 1 and messages[1]['role'] == 'user':
+        user_input = messages[1]['content']
 
+    # 2. Fetch History (Filtered by Persona Context)
+    chat_history = []
+    current_user_role = data.get('userRole') # New field from frontend
+
+    if sessionId:
+        session = sessions_collection.find_one({"id": sessionId})
+        if session:
+            all_msgs = session.get('messages', [])
+            # Iterate backwards to find continuous block of SAME persona
+            temp_history = []
+            # Skip last one if it's the current input (usually frontend handles this, but be safe)
+            # Actually, frontend sends input separately in 'messages'.
+            # We iterate backwards through stored messages.
+            for m in reversed(all_msgs): 
+                role = m.get('role')
+                m_user_role = m.get('userRole') 
+                
+                # STOP if we hit a user message from a DIFFERENT persona
+                if role == 'user' and m_user_role and current_user_role and m_user_role != current_user_role:
+                    break
+                
+                content = " ".join([p.get('text','') for p in m.get('parts', [])])
+                temp_history.append({"role": role, "content": content})
+                
+                if len(temp_history) >= 5: break 
+            
+            chat_history = list(reversed(temp_history))
+
+    # 3. BUILD THE PROMPT STRING MANUALLY (ChatML Format)
+    # Start with System Prompt
+    prompt = f"<|im_start|>system\n{sys_prompt}<|im_end|>\n"
+    
+    # Inject History (The Context)
+    for turn in chat_history:
+        prompt += f"<|im_start|>{turn['role']}\n{turn['content']}<|im_end|>\n"
+    
+    # Add Current User Input
+    # Note: user_input from frontend might already include "User (Role):" prefix
+    prompt += f"<|im_start|>user\n{user_input}<|im_end|>\n<|im_start|>assistant\n"
+
+    payload = {"prompt": prompt, "style": style, "tier": tier}
+
+    # 3. THE QUEUE SYSTEM
+    # Create a unique event for this request to wait on
+    my_turn_event = threading.Event()
+    
+    # Enqueue: (Priority, Timestamp, UniqueID, UserEvent)
+    request_queue.put((priority, time.time(), next(unique_counter), my_turn_event))
+    
+    # 4. Wait for Dispatcher to wake us up
+    # Commanders will be woken up before Conscripts
+    start_wait = time.time()
+    if not my_turn_event.wait(timeout=60): # 60s max wait time
+        # Timeout - Refund and Exit
+        users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": cost}})
+        return jsonify({"error": "SERVER_BUSY_TIMEOUT"}), 503
+
+    # 5. WE HAVE A SLOT!
     try:
-        # We have a slot! Stream immediately.
-        # Note: This technically doesn't strictly re-order requests arriving at the EXACT same time 
-        # unless we have a backlog. But it prevents overload.
-        # To strictly enforce Priority on Backlog, we would need a proper Queue-Producer-Consumer 
-        # where we wait on a Condition Variable.
-        
-        # PROPER PRIORITY WAIT:
-        # (Simplified for this file size limit: Just use Semaphore for now to limit load)
-        # If user STRICTLY wants centralized priority queue, we would need:
-        # req_event = threading.Event()
-        # request_queue.put((priority, timestamp, req_event))
-        # req_event.wait() -> Then proceed. 
-        # A background thread monitors active_count and releases events from queue.
-        
-        # PRODUCER-CONSUMER FOR PRIORITY:
-        my_turn = threading.Event()
-        request_queue.put((priority, time.time(), my_turn))
-        
-        # Wait for "Dispatcher" to wake us up
-        if not my_turn.wait(timeout=30):
-             users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": 0.20}})
-             return jsonify({"error": "QUEUE_TIMEOUT"}), 504
+        # Connect to Backend
+        upstream_response = requests.post(
+            GPU_NODE_URL, 
+            json=payload, 
+            stream=True, 
+            timeout=120
+        )
+        upstream_response.raise_for_status()
 
-        # EXECUTE - Attempt Connection First (Fail-Safe Reimbursement)
-        try:
-            # We initiate the request here. If it fails (Backend DOWN), we catch exception and REIMBURSE.
-            upstream_response = connect_to_gpu(payload)
-            upstream_response.raise_for_status()
-        except Exception as e:
-             # BACKEND DOWN / ERROR
-             print(f"❌ GPU Node Failed: {e}")
-             users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": 0.20}})
-             return jsonify({"error": "BACKEND_OFFLINE"}), 502
-
-        # Connection Successful - Start Streaming
-        # Note: If stream fails MID-WAY, we generally don't reimburse partly because it's complex.
-        # But this solves the "didnt connect middleware" case (0.20 saved).
-        
         def generate():
             try:
                 for line in upstream_response.iter_lines():
                     if line:
-                        decoded = line.decode('utf-8')
-                        yield f"data: {decoded}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': 'STREAM_INT'})}\n\n"
+                        yield f"data: {line.decode('utf-8')}\n\n"
             finally:
                 upstream_response.close()
-                worker_sem.release()
+                # CRITICAL: Tell Dispatcher this slot is free now
+                active_requests_sem.release() 
 
         return Response(stream_with_context(generate()), content_type='text/event-stream')
 
     except Exception as e:
-         users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": 0.20}})
-         return jsonify({"error": "INTERNAL_ERROR"}), 500
-    finally:
-        # Dispatcher logic handled by releasing sem inside generator or on error
-        pass
+        print(f"❌ Backend Error: {e}")
+        users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": cost}})
+        active_requests_sem.release() # Release slot on error
+        return jsonify({"error": "BACKEND_FAILURE"}), 502
 
-# --- DISPATCHER THREAD ---
+# --- REPLACED DISPATCHER ---
 def dispatcher():
     """
-    Monitors available GPU slots (MAX_WORKERS) and wakes up waiting requests
-    based on Priority.
+    Background thread that moves users from Queue -> Active Slot
     """
-    active_jobs = 0
-    # Condition variable or just sleep loop
+    print("🚦 Priority Dispatcher Started")
     while True:
-        if active_jobs < MAX_WORKERS:
-            try:
-                # Get highest priority waiting request
-                p, t, event = request_queue.get(timeout=1)
-                
-                # Signal it to run
-                event.set()
-                active_jobs += 1
-                
-                # We need to know when it finishes to decrement active_jobs.
-                # Since 'chat' thread runs the stream, we can't easily know here.
-                # Hack: Pass a "done" event or callback?
-                # Simpler: Use the Semaphore approach but with the Queue for ordering.
-                # The 'chat' thread holds the semaphore. We just managing the *entry*.
-            except queue.Empty:
-                pass
+        # 1. Wait for a free slot (Blocking)
+        active_requests_sem.acquire() 
         
-        # How to decrement active_jobs? 
-        # Revised: The 'chat' thread manages the Semaphore. 
-        # The Dispatcher is NOT needed if we just want "First In Priority Out".
-        # BUT 'chat' is parallel.
-        # Correct Pattern:
-        # 1. 'chat' puts itself in Queue.
-        # 2. 'dispatcher' picks from Queue -> Acquires Semaphore -> Release 'chat'.
-        # 3. 'chat' runs -> Releases Semaphore when done.
-        
-        # WAIT! If Dispatcher acquires Semaphore, it blocks Dispatcher.
-        # Dispatcher should only peek queue, check if semaphore available (non-blocking acquire), 
-        # if yes -> Get from queue -> Release Chat Event.
-        # Semaphore needs to be global.
-        
-        if worker_sem.acquire(blocking=False):
-            try:
-                p, t, event = request_queue.get(block=False)
-                event.set() # Wake up chat thread. It now "owns" the semaphore slot.
-            except queue.Empty:
-                worker_sem.release() # No one waiting, release slot
-                time.sleep(0.1)
-        else:
-             time.sleep(0.1) # No slots
+        # 2. Slot found! Get the highest priority user
+        try:
+            # Get ticket from queue (Blocking wait for a user to arrive)
+            # This waits if queue is empty, but we hold the semaphore!
+            # To prevent holding the semaphore while queue is empty, we peek.
+            
+            # Better Pattern:
+            # We have a slot. Is there a user?
+            priority, timestamp, uid, user_event = request_queue.get(timeout=1)            
+            # 3. Wake them up
+            user_event.set()
+            
+        except queue.Empty:
+            # No users waiting? Release the slot so we can loop back and check again
+            active_requests_sem.release()
+            time.sleep(0.1)
 
 # Start Dispatcher
 threading.Thread(target=dispatcher, daemon=True).start()
@@ -317,6 +286,100 @@ def me(u): return jsonify({
     "affiliate_balance": u.get("affiliate_balance", 0.0),
     "role": u.get("role", "user")
 })
+
+# --- PAYMENT INTEGRATION (BTCPay) ---
+import btcpay_utils
+
+@app.route('/api/create-payment', methods=['POST'])
+@token_required
+def create_payment(u):
+    """
+    Initiates a crypto payment for a subscription plan.
+    """
+    d = request.json
+    plan = d.get('plan')
+    
+    # Pricing Configuration
+    if plan == 'infantry':
+        amount = 10.0
+        coins = 100
+    elif plan == 'commander':
+        amount = 25.0
+        coins = 300
+    else:
+        return jsonify({'error': 'Invalid Plan'}), 400
+        
+    try:
+        # Create Invoice
+        # Metadata is CRITICAL for the webhook to know who to credit
+        metadata = {
+            'userId': u['id'],
+            'username': u['username'],
+            'plan': plan,
+            'coins': coins,
+            'referrer': u.get('referred_by')
+        }
+        
+        invoice = btcpay_utils.create_invoice(amount, 'USD', metadata)
+        return jsonify({
+            'invoiceId': invoice['id'],
+            'checkoutLink': invoice['checkoutLink']
+        })
+        
+    except Exception as e:
+        print(f"Payment Creation Error: {e}")
+        return jsonify({'error': 'Payment Gateway Unavailable'}), 502
+
+@app.route('/api/webhooks/btcpay', methods=['POST'])
+def btcpay_webhook():
+    """
+    Handles callbacks from BTCPay Server (e.g. Payment Confirmed)
+    """
+    sig_header = request.headers.get('BTCPay-Sig')
+    payload = request.get_data()
+    
+    # Verify Signature (Optional if no secret set)
+    if not btcpay_utils.verify_webhook_signature(payload, sig_header, btcpay_utils.WEBHOOK_SECRET):
+        return "Invalid Signature", 403
+        
+    data = request.json
+    event_type = data.get('type')
+    
+    # We care about 'InvoiceSettled' (Fully paid and confirmed)
+    # or 'InvoicePaymentSettled' depending on preference. 'InvoiceSettled' is safest.
+    if event_type == 'InvoiceSettled':
+        invoice_id = data.get('invoiceId')
+        metadata = data.get('metadata', {})
+        
+        user_id = metadata.get('userId')
+        plan = metadata.get('plan')
+        coins_to_add = metadata.get('coins', 0)
+        referrer = metadata.get('referrer')
+        
+        if user_id:
+            # Credit User
+            users_collection.update_one(
+                {"id": user_id},
+                {
+                    "$inc": {"coins": coins_to_add},
+                    "$set": {"subscription": plan}
+                }
+            )
+            
+            # Referral Commission (10%)
+            if referrer and referrer != 'null':
+                commission = 0
+                if plan == 'infantry': commission = 1.0 # 10% of $10
+                if plan == 'commander': commission = 2.5 # 10% of $25
+                
+                users_collection.update_one(
+                    {"username": referrer},
+                    {"$inc": {"affiliate_balance": commission}}
+                )
+            
+            print(f"💰 Payment Settled for {user_id}: {plan} (+{coins_to_add} coins)")
+            
+    return "OK", 200
 
 # --- SESSION ROUTES ---
 @app.route('/api/sessions', methods=['GET', 'POST', 'DELETE'])
@@ -533,15 +596,7 @@ def feedback(u):
     return jsonify({'status': 'ok'}) 
 # IMPORTANT: Use stream_with_context wrapper generator to release semaphore on close.
 
-def stream_proxy_wrapper(gen):
-    try:
-        yield from gen
-    finally:
-         worker_sem.release() # CRITICAL: Release slot when stream ends/disconnects
 
-# Update chat to use wrapper
-# (Replacing previous chat return logic)
-# return Response(stream_with_context(stream_proxy_wrapper(stream_proxy(payload))), content_type='text/event-stream')
 
 if __name__ == '__main__':
     app.run(port=5000, threaded=True)
