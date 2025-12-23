@@ -18,6 +18,8 @@ unique_counter = itertools.count()
 app = Flask(__name__, static_folder='dist', static_url_path='')
 CORS(app)
 
+import certifi
+
 # --- CONFIGURATION ---
 MONGO_URI = "mongodb+srv://admin:T2b_T.gTEv%40qmFB@cluster0.ytnahqm.mongodb.net/?appName=Cluster0"
 DB_NAME = "dictator_ai_db"
@@ -31,36 +33,13 @@ MAX_WORKERS = 20
 request_queue = queue.PriorityQueue()
 active_requests_sem = threading.Semaphore(MAX_WORKERS)
 
-# --- DB SETUP (Simulated for brevity, full code assumed same as before) ---
-class MockCollection:
-    def __init__(self, name=""):
-        self.data = []
-        if name == "users":
-            self.data.append({"id": "123456", "username": "HighCommand", "password": generate_password_hash("123456"), "role": "admin", "coins": 9999, "subscription": "commander"})
-            self.data.append({"id": "u1", "username": "BrowserAgent", "password": generate_password_hash("12345678"), "role": "user", "coins": 10.0, "subscription": "free"})
-        if name == "sessions":
-             self.data.append({"id": "s1", "userId": "u1", "title": "OPERATION BARBAROSSA", "timestamp": datetime.utcnow().isoformat(), "leaderId": "hitler", "style": "The Berghof", "messages": [{"role": "model", "parts": [{"text": "INITIALIZING..."}]}]})
 
-    def find_one(self, q): return next((d for d in self.data if all(d.get(k)==v for k,v in q.items())), None)
-    def update_one(self, q, u, upsert=False): 
-        t = self.find_one(q)
-        if t: 
-            if "$set" in u: t.update(u["$set"])
-            if "$inc" in u: 
-                for k,v in u["$inc"].items(): t[k] = t.get(k,0)+v
-        elif upsert:
-            n = q.copy()
-            if "$set" in u: n.update(u["$set"])
-            self.data.append(n)
-        return type('obj',(),{'modified_count':1})
-    def insert_one(self, d): self.data.append(d)
-    def find(self, q): return [d for d in self.data if all(d.get(k)==v for k,v in q.items())]
-    def count_documents(self, q): return len(self.find(q))
-    def aggregate(self, p): return [] # Mock
-print("hello")
+# --- DB CONNECT ---
+
+
 try:
 
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, tlsCAFile=certifi.where())
     db = client[DB_NAME]
     users_collection = db["users"]
     sessions_collection = db["sessions"]
@@ -407,7 +386,7 @@ def sessions(u):
 
     if request.method == 'DELETE':
         sid = request.args.get('id')
-        sessions_collection.data = [x for x in sessions_collection.data if x['id'] != sid] if isinstance(sessions_collection, MockCollection) else sessions_collection.delete_one({"id": sid})
+        sessions_collection.delete_one({"id": sid})
         return jsonify({'status': 'deleted'})
 
 
@@ -467,39 +446,23 @@ def admin_stats(u):
     if u['role'] != 'admin': return jsonify({'error': 'Forbidden'}), 403
     
     # Aggregates
-    total_users = sessions_collection.count_documents({}) if isinstance(sessions_collection, MockCollection) else users_collection.count_documents({}) # Approx
-    if not isinstance(users_collection, MockCollection):
-         total_users = users_collection.count_documents({})
+    total_users = users_collection.count_documents({})
     
     # Coins
     total_coins = 0
-    if isinstance(users_collection, MockCollection):
-        total_coins = sum([x.get('coins',0) for x in users_collection.data])
-    else:
-        # Mongo aggregate
-        pipeline = [{"$group": {"_id": None, "total": {"$sum": "$coins"}}}]
-        agg = list(users_collection.aggregate(pipeline))
-        if agg: total_coins = agg[0]['total']
+    # Mongo aggregate
+    pipeline = [{"$group": {"_id": None, "total": {"$sum": "$coins"}}}]
+    agg = list(users_collection.aggregate(pipeline))
+    if agg: total_coins = agg[0]['total']
 
     # Subs
     subs = {"free": 0, "infantry": 0, "commander": 0}
-    if isinstance(users_collection, MockCollection):
-        for x in users_collection.data:
-            s = x.get('subscription', 'free')
-            subs[s] = subs.get(s, 0) + 1
-    else:
-        # Simple counts
-        subs['free'] = users_collection.count_documents({"subscription": "free"})
-        subs['infantry'] = users_collection.count_documents({"subscription": "infantry"})
-        subs['commander'] = users_collection.count_documents({"subscription": "commander"})
+    subs['free'] = users_collection.count_documents({"subscription": "free"})
+    subs['infantry'] = users_collection.count_documents({"subscription": "infantry"})
+    subs['commander'] = users_collection.count_documents({"subscription": "commander"})
 
     # Referral Stats
-    referred_users = 0
-    if isinstance(users_collection, MockCollection):
-         referred_users = 0
-    else:
-        # Count users where referred_by exists and is not null
-        referred_users = users_collection.count_documents({"referred_by": {"$nin": [None, "", "null"]}})
+    referred_users = users_collection.count_documents({"referred_by": {"$nin": [None, "", "null"]}})
 
     independent_users = total_users - referred_users
 

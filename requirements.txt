@@ -6,3 +6,4 @@ dnspython
 pyjwt
 gunicorn
 werkzeug
+certifi
