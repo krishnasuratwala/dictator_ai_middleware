@@ -18,7 +18,7 @@ Add these in the Render Dashboard:
 | Key | Value |
 | --- | --- |
 | `PYTHON_VERSION` | `3.11.0` |
-| `GPU_NODE_URL` | `http://[VAST_IP]:[PORT]/generate` (e.g. `http://152.x.x.x:6000/generate`) |
+| `GPU_NODE_URL` | `http://[VAST_IP]:[PORT]/generate_stream` (e.g. `http://152.x.x.x:6000/generate_stream`) |
 | `SECRET_KEY` | [Generate a random strong string] |
 | `MONGO_URI` | [Your MongoDB Connection String] |
 

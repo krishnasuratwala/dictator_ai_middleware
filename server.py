@@ -22,7 +22,7 @@ CORS(app)
 MONGO_URI = "mongodb+srv://admin:T2b_T.gTEv%40qmFB@cluster0.ytnahqm.mongodb.net/?appName=Cluster0"
 DB_NAME = "dictator_ai_db"
 # Use /generate_stream endpoint on Backend
-GPU_NODE_URL = os.getenv("GPU_NODE_URL", "http://127.0.0.1:6000").rstrip('/') + "/generate_stream"
+GPU_NODE_URL = os.getenv("GPU_NODE_URL", "http://199.126.134.31:55870").rstrip('/') + "/generate_stream"
 SECRET_KEY = os.getenv("SECRET_KEY", "dictator_ai_top_secret_key_v1")
 
 # --- CONCURRENCY CONTROL (SCALABLE QUEUE) ---
