@@ -246,8 +246,23 @@ def dispatcher():
              logger.error(f"💀 Dispatcher CRASHED (Recovering...): {e}")
              time.sleep(1)
 
-# Start Dispatcher
-threading.Thread(target=dispatcher, daemon=True).start()
+def start_dispatcher():
+    # Check if thread is already running
+    for t in threading.enumerate():
+        if t.name == "DispatcherThread":
+            return
+            
+    t = threading.Thread(target=dispatcher, daemon=True, name="DispatcherThread")
+    t.start()
+    logger.info("⚙️ Dispatcher Thread Launched (Worker Process)")
+
+# Ensure dispatcher runs in the worker process, not just master
+@app.before_request
+def ensure_dispatcher_running():
+    start_dispatcher()
+
+# Also try to start it immediately (for local dev)
+start_dispatcher()
 
 # --- OTHER ROUTES (User, Login, Admin) Copied from previous logic ---
 # (For brevity, I assume standard auth routes login/signup/me exist here. 
