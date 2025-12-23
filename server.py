@@ -184,31 +184,35 @@ def chat(current_user):
         return jsonify({"error": "BACKEND_FAILURE"}), 502
 
 # --- REPLACED DISPATCHER ---
+# --- REPLACED DISPATCHER ---
 def dispatcher():
     """
     Background thread that moves users from Queue -> Active Slot
     """
     print("🚦 Priority Dispatcher Started")
     while True:
-        # 1. Wait for a free slot (Blocking)
-        active_requests_sem.acquire() 
-        
-        # 2. Slot found! Get the highest priority user
         try:
-            # Get ticket from queue (Blocking wait for a user to arrive)
-            # This waits if queue is empty, but we hold the semaphore!
-            # To prevent holding the semaphore while queue is empty, we peek.
+            # 1. Wait for a free slot (Blocking)
+            # print(f"Dispatcher: Waiting for slot... (Active: {MAX_WORKERS - active_requests_sem._value})") 
+            active_requests_sem.acquire() 
             
-            # Better Pattern:
-            # We have a slot. Is there a user?
-            priority, timestamp, uid, user_event = request_queue.get(timeout=1)            
-            # 3. Wake them up
-            user_event.set()
-            
-        except queue.Empty:
-            # No users waiting? Release the slot so we can loop back and check again
-            active_requests_sem.release()
-            time.sleep(0.1)
+            # 2. Slot found! Get the highest priority user
+            try:
+                # Get ticket from queue (Blocking wait for a user to arrive)
+                # print("Dispatcher: Slot acquired, checking queue...")
+                priority, timestamp, uid, user_event = request_queue.get(timeout=1)            
+                
+                # 3. Wake them up
+                print(f"Dispatcher: Processing User {uid}, waking them up!")
+                user_event.set()
+                
+            except queue.Empty:
+                # No users waiting? Release the slot so we can loop back and check again
+                active_requests_sem.release()
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"❌ DISPATCHER CRASHED (Restarting...): {e}")
+            time.sleep(1)
 
 # Start Dispatcher
 threading.Thread(target=dispatcher, daemon=True).start()
