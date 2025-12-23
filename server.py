@@ -13,6 +13,17 @@ import queue
 import threading
 import json
 import itertools
+import logging
+import sys
+
+# --- LOGGING CONFIG ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 unique_counter = itertools.count()
 
 app = Flask(__name__, static_folder='dist', static_url_path='')
@@ -26,6 +37,9 @@ DB_NAME = "dictator_ai_db"
 # Use /generate_stream endpoint on Backend
 GPU_NODE_URL = os.getenv("GPU_NODE_URL", "http://199.126.134.31:55870").rstrip('/') + "/generate_stream"
 SECRET_KEY = os.getenv("SECRET_KEY", "dictator_ai_top_secret_key_v1")
+
+logger.info(f"🚀 SERVER STARTING...")
+logger.info(f"🔗 GPU_NODE_URL: {GPU_NODE_URL}")
 
 # --- CONCURRENCY CONTROL (SCALABLE QUEUE) ---
 # MAX_WORKERS = 20  <-- CHANGE THIS TO 20 (Matches your optimized GPU Node)
@@ -43,9 +57,9 @@ try:
     db = client[DB_NAME]
     users_collection = db["users"]
     sessions_collection = db["sessions"]
-    print(f"✅ DB Connected")
+    logger.info(f"✅ DB Connected")
 except:
-    print("❌ DB Connection Failed , Please refresh the page")
+    logger.error("❌ DB Connection Failed , Please refresh the page")
 
 # --- AUTH DECORATOR ---
 def token_required(f):
@@ -71,6 +85,8 @@ def chat(current_user):
     messages = data.get('messages', [])
     style = data.get('style', 'The Berghof')
     tier = current_user.get('subscription', 'free')
+
+    logger.info(f"💬 Chat Request from {current_user['username']} ({tier})")
 
     # 1. Billing Check
     cost = 0.20
@@ -144,19 +160,24 @@ def chat(current_user):
     my_turn_event = threading.Event()
     
     # Enqueue: (Priority, Timestamp, UniqueID, UserEvent)
-    request_queue.put((priority, time.time(), next(unique_counter), my_turn_event))
+    req_id = next(unique_counter)
+    request_queue.put((priority, time.time(), req_id, my_turn_event))
+    logger.info(f"📥 Queued Request {req_id} (Priority: {priority})")
     
     # 4. Wait for Dispatcher to wake us up
     # Commanders will be woken up before Conscripts
     start_wait = time.time()
     if not my_turn_event.wait(timeout=60): # 60s max wait time
         # Timeout - Refund and Exit
+        logger.warning(f"⏰ Timeout waiting for slot. Request {req_id}")
         users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": cost}})
         return jsonify({"error": "SERVER_BUSY_TIMEOUT"}), 503
 
     # 5. WE HAVE A SLOT!
+    logger.info(f"🟢 Slot Acquired for Request {req_id}")
     try:
         # Connect to Backend
+        logger.info(f"📡 Connecting to GPU Node: {GPU_NODE_URL}")
         upstream_response = requests.post(
             GPU_NODE_URL, 
             json=payload, 
@@ -164,21 +185,25 @@ def chat(current_user):
             timeout=120
         )
         upstream_response.raise_for_status()
+        logger.info(f"✅ Connected to GPU Node for Request {req_id}")
 
         def generate():
             try:
                 for line in upstream_response.iter_lines():
                     if line:
                         yield f"data: {line.decode('utf-8')}\n\n"
+            except Exception as e:
+                logger.error(f"❌ Streaming Error in Request {req_id}: {e}")
             finally:
                 upstream_response.close()
                 # CRITICAL: Tell Dispatcher this slot is free now
                 active_requests_sem.release() 
+                logger.info(f"🏁 Request {req_id} Finished. Slot Released.")
 
         return Response(stream_with_context(generate()), content_type='text/event-stream')
 
     except Exception as e:
-        print(f"❌ Backend Error: {e}")
+        logger.error(f"❌ Backend Error in Request {req_id}: {e}")
         users_collection.update_one({"id": current_user['id']}, {"$inc": {"coins": cost}})
         active_requests_sem.release() # Release slot on error
         return jsonify({"error": "BACKEND_FAILURE"}), 502
@@ -188,27 +213,38 @@ def dispatcher():
     """
     Background thread that moves users from Queue -> Active Slot
     """
-    print("🚦 Priority Dispatcher Started")
+    logger.info("🚦 Priority Dispatcher Started")
     while True:
-        # 1. Wait for a free slot (Blocking)
-        active_requests_sem.acquire() 
-        
-        # 2. Slot found! Get the highest priority user
         try:
-            # Get ticket from queue (Blocking wait for a user to arrive)
-            # This waits if queue is empty, but we hold the semaphore!
-            # To prevent holding the semaphore while queue is empty, we peek.
+            # 1. Wait for a free slot (Blocking)
+            # logger.debug("Dispatcher waiting for semaphore...")
+            active_requests_sem.acquire() 
             
-            # Better Pattern:
-            # We have a slot. Is there a user?
-            priority, timestamp, uid, user_event = request_queue.get(timeout=1)            
-            # 3. Wake them up
-            user_event.set()
-            
-        except queue.Empty:
-            # No users waiting? Release the slot so we can loop back and check again
-            active_requests_sem.release()
-            time.sleep(0.1)
+            # 2. Slot found! Get the highest priority user
+            try:
+                # Get ticket from queue (Blocking wait for a user to arrive)
+                # This waits if queue is empty, but we hold the semaphore!
+                # To prevent holding the semaphore while queue is empty, we peek.
+                
+                # Better Pattern:
+                # We have a slot. Is there a user?
+                if request_queue.empty():
+                     active_requests_sem.release()
+                     time.sleep(0.1)
+                     continue
+
+                priority, timestamp, uid, user_event = request_queue.get(timeout=1)            
+                # 3. Wake them up
+                logger.info(f"🔔 Dispatching Request {uid}")
+                user_event.set()
+                
+            except queue.Empty:
+                # No users waiting? Release the slot so we can loop back and check again
+                active_requests_sem.release()
+                time.sleep(0.1)
+        except Exception as e:
+             logger.error(f"💀 Dispatcher CRASHED (Recovering...): {e}")
+             time.sleep(1)
 
 # Start Dispatcher
 threading.Thread(target=dispatcher, daemon=True).start()
@@ -356,7 +392,7 @@ def btcpay_webhook():
                     {"$inc": {"affiliate_balance": commission}}
                 )
             
-            print(f"💰 Payment Settled for {user_id}: {plan} (+{coins_to_add} coins)")
+            logger.info(f"💰 Payment Settled for {user_id}: {plan} (+{coins_to_add} coins)")
             
     return "OK", 200
 
